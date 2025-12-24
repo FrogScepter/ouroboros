@@ -24,6 +24,7 @@
 # - In test_cosmic_simulation: Adjusted assert to >1e10 for realistic value.
 # - Removed raise in simulate_pi_variation, added clamp position_ratio = np.clip(position_ratio, 0, 1)
 # - Similarly clamped in hybrid_de_tension, simulate_c_variation, etc.
+# - Clamped in simulate_bh_evaporation, axion_anisotropy, refract_vibration, simulate_rotation_curve.
 
 # Setup: Same as original, plus plotly for viz.
 
@@ -1088,7 +1089,7 @@ class Pi2Framework:
     def __init__(self, deviation=2, radius=46.5e9, scale_factor=10, base_de=0.68, min_tension=0.1,
                  mathematical_center=[0.0, 0.0, 0.0], equilibrium_threshold=0.01, de_multiplier=1.0,
                  integer_snap_ratio=1.0, h0_base=67.66, omega_m_base=0.311, w_de_base=-0.95, lambda_const=1.11e-52, t_cmb_base=2.72548, entropy_rate=1e-5,
-                 grid_resolution=100, entity_density={'cosmic': 800, 'planetary': 4000, 'human': 400},  # Adjustable for deployment
+                 grid_resolution=100, entity_density={'cosmic': 1000, 'planetary': 10000, 'human': 100000},  # Adjustable for deployment
                  neutral_observer_pos=np.array([0,0,0]), zoom_levels={'cosmic': (-1.0, 0.0), 'planetary': (0.0, 0.5), 'human': (0.5, 1.0)},
                  law_neutrality_factor=0.0, real_data_sources={}, simulation_timestep=1e-3, lod_thresholds=[1e15, 1e10, 1e5]):  # Adjusted lod for large radius
         self.deviation = float(deviation)  # Ensure float for consistency
@@ -1753,4 +1754,3 @@ if __name__ == "__main__":
 fw = Pi2Framework()
 print(fw.cosmo_core.hybrid_de_tension(0.5))
 print(fw.cosmo_core.hybrid_de_tension(1.0))
-
