@@ -13,6 +13,13 @@
 # - 3D geometry: Positions snapped to deviation grid, norms checked for sphere containment.
 # - Efficiency: Reduced entity counts for testing; vectorized dists/norms.
 
+# Fixes from Logs:
+# - Added self.spatial_hierarchy = SpatialHierarchy(self) in CosmoCore.__init__.
+# - In prune_weights: Added dtype=torch.float32 to torch.tensor for signs assignment.
+# - In Entity.__init__: self.pos = np.array(pos, dtype=float) to avoid int dtype.
+# - In compute_gravity_force: Added scaled_force = max(scaled_force, 0) to ensure positive force.
+# - In test_entity_interact and others: Ensured float positions.
+
 # Setup: Same as original, plus plotly for viz.
 
 import numpy as np
@@ -533,7 +540,7 @@ class QuantumBio:
 class Entity(QuantumBio.Observer):
     def __init__(self, pos, scale_type, framework):
         super().__init__(framework)
-        self.pos = pos
+        self.pos = np.array(pos, dtype=float)  # Fix: Ensure float dtype
         self.scale_type = scale_type
         self.vib_amp = np.random.uniform(*framework.base_range)
         self.mass = np.random.uniform(1e26, 1e30) if scale_type == 'cosmic' else 1e24 if scale_type == 'planetary' else 70  # Example masses
@@ -558,26 +565,49 @@ class Entity(QuantumBio.Observer):
         return perturbed_tension
 
 class CosmoCore:
+    """
+    Handles cosmology simulations, including tension, c variation, gravity, DE.
+    """
     def __init__(self, core):
         self.core = core
+        self.spatial_hierarchy = SpatialHierarchy(self)  # Fix: Initialize here
 
     def hybrid_de_tension(self, position_ratio, reversal=False, t=0):
+        """
+        Computes hybrid DE tension without boundary imprinting, using feedback-damped scaling with min floor.
+        Now time-dependent and linked to simulate_c_variation. Allows negatives with growth.
+        Added missed potential subtraction for optimized negative flip.
+        Tied to axion_anisotropy for increased accuracy (subtracted for weakening DE).
+        New: Subtract entropy_rate * t * deviation for gradual entropy increase.
+        
+        Args:
+            position_ratio (float): Ratio from center (0) to boundary (1).
+            reversal (bool): If True, reverse scaling (stronger centrally).
+            t (float): Time in years (default 0).
+        
+        Returns:
+            float: DE tension at position and time.
+        """
         pi_at_pos = self.core.simulate_pi_variation(position_ratio, t=t)
         tilde_c = self.simulate_c_variation(position_ratio, t=t, without_tension=True)
+        # Feedback-damped: Evolves quintessence-like, base * multiplier * (1 - dev / pi_at_pos) * exp(-decay * t * dev / tilde_c)
         tension = self.core.base_de * self.core.de_multiplier * (1 - self.core.deviation / pi_at_pos) * np.exp(-self.core.decay_lambda_base * t * (self.core.deviation / tilde_c))
+        # Missed potential subtraction for negative flip
         exp_term = np.exp(-self.core.decay_lambda_base * t * (self.core.deviation / tilde_c))
         missed = self.core.missed_coeff * self.core.deviation * (1 - exp_term)
         tension -= missed
+        # Tie to axion anisotropy for accuracy (subtracted to weaken DE, matching DESI)
         ani = self.axion_anisotropy(position_ratio, t=t)
-        tension -= ani * self.core.missed_coeff
+        tension -= ani * self.core.missed_coeff  # Scaled subtraction
+        # New: Entropy subtraction for gradual increase
         tension -= self.core.entropy_rate * t * self.core.deviation
         if reversal:
-            tension /= (1 + position_ratio)
-        if tension < self.core.base_range[0]:
-            tension *= (1 + self.core.decay_lambda_base * t)
-            tension = max(tension, self.core.base_range[0] * 10)
-        tension *= (0.1 / self.core.min_tension)
-        return max(tension, self.core.base_range[0])
+            tension /= (1 + position_ratio)  # Reversal: Weaker at edges
+        if tension < self.core.base_range[0]:  # If too negative, grow (make more negative, clamped)
+            tension *= (1 + self.core.decay_lambda_base * t)  # Growth factor for negatives
+            tension = max(tension, self.core.base_range[0] * 10)  # Clamp for stability
+        tension *= (0.1 / self.core.min_tension)  # Normalize ratio to old scale for "working" alignment
+        return max(tension, self.core.base_range[0])  # Overall floor
 
     def hybrid_de_tension_vectorized(self, position_ratios, reversal=False, t=0):
         if not isinstance(position_ratios, np.ndarray):
@@ -590,17 +620,29 @@ class CosmoCore:
         tension -= missed
         ani = np.array([self.axion_anisotropy(p, t=t) for p in position_ratios])
         tension -= ani * self.core.missed_coeff
+        # New: Vectorized entropy subtraction
         tension -= self.core.entropy_rate * t * self.core.deviation
         if reversal:
             tension /= (1 + position_ratios)
         neg_mask = tension < self.core.base_range[0]
         tension[neg_mask] *= (1 + self.core.decay_lambda_base * t)
         tension[neg_mask] = np.maximum(tension[neg_mask], self.core.base_range[0] * 10)
-        tension *= (0.1 / self.core.min_tension)
+        tension *= (0.1 / self.core.min_tension)  # Normalize vectorized
         tension = np.maximum(tension, self.core.base_range[0])
         return tension
 
     def simulate_c_variation(self, position_ratio, t=0, without_tension=False):
+        """
+        Models variable coordinate speed of light decreasing towards boundary due to curvature.
+        
+        Args:
+            position_ratio (float): Ratio from center (0) to boundary (1).
+            t (float): Time in years (default 0).
+            without_tension (bool): If True, skip tension adjustment to avoid recursion (default False).
+        
+        Returns:
+            float: Effective coordinate speed of light at position and time.
+        """
         if not 0 <= position_ratio <= 1:
             raise ValueError("Position ratio must be between 0 and 1.")
         delta = (self.core.pi_center - self.core.effective_pi) / self.core.pi_center
@@ -608,12 +650,23 @@ class CosmoCore:
         if not without_tension:
             tension = self.hybrid_de_tension(position_ratio, t=t)
             tilde_c *= (1 + self.core.w_de_base * tension)
-        if tilde_c < self.core.base_range[0]:
+        if tilde_c < self.core.base_range[0]:  # Allow negative but grow/clamp
             tilde_c *= (1 + self.core.decay_lambda_base * t)
-        tilde_c = max(tilde_c, self.core.min_c)
+        tilde_c = max(tilde_c, self.core.min_c)  # Clamp to avoid unphysical low values or negatives
         return tilde_c
 
     def propagate_light(self, distance, position_ratio_start=0.0, t=0):
+        """
+        Simulates light propagation as geodesics on the sphere, returning adjusted (bent) distance.
+        
+        Args:
+            distance (float): Propagation distance.
+            position_ratio_start (float): Starting position ratio from center (default 0.0).
+            t (float): Time in years (default 0).
+        
+        Returns:
+            float: Adjusted distance after propagation, snapped to equilibrium.
+        """
         position_ratio_end = min(position_ratio_start + (distance / self.core.get_radius(t)), 1.0)
         avg_pi = (self.core.simulate_pi_variation(position_ratio_start, t=t) + self.core.simulate_pi_variation(position_ratio_end, t=t)) / 2
         avg_c = (self.simulate_c_variation(position_ratio_start, t=t) + self.simulate_c_variation(position_ratio_end, t=t)) / 2
@@ -625,97 +678,206 @@ class CosmoCore:
         return equilibrated
 
     def ratio_constraint(self, type='dev_pi', t=0):
+        """
+        Computes mathematical certainties/constraints (e.g., dev/pi ratio).
+        
+        Args:
+            type (str): Type of ratio (e.g., 'dev_pi').
+            t (float): Time in years (default 0).
+        
+        Returns:
+            float: Ratio value.
+        """
         if type == 'dev_pi':
-            return self.core.deviation / self.core.effective_pi
+            return self.core.deviation / self.core.effective_pi  # Always 1
         elif type == 'surface_volume':
-            return 3 / self.core.get_radius(t)
+            return 3 / self.core.get_radius(t)  # 3/r certainty, time-varying
         elif type == 'light_horizon':
-            return self.core.c_base * t
+            return self.core.c_base * t  # Simple light horizon (distance = c * t)
         else:
             raise ValueError(f"Unknown ratio type: {type}")
 
     def decay_mechanism(self, initial_value, time, decay_type='radioactive'):
-        time_s = time * self.core.sec_per_year
+        """
+        Simulates radioactive/general decay as exponential potential release toward equilibrium.
+        Allows negatives with growth and negative flip for superposition.
+        Added phantom mode for w<-1.
+        New: Added 'hawking' mode for power-law mass loss dM/dt ∝ -1/M², using M(t) = (M0^3 - α t)^{1/3}.
+        
+        Args:
+            initial_value (float): Initial quantity (e.g., N0 atoms or BH mass).
+            time (float): Time elapsed (in years).
+            decay_type (str): Type of decay (e.g., 'radioactive' for exponential).
+        
+        Returns:
+            float: Decayed value, snapped to finite equilibrium.
+        """
+        time_s = time * self.core.sec_per_year  # Convert to seconds for SI units
         if decay_type == 'radioactive':
+            # Exponential law: N(t) = N0 * e^(-λ t), λ modulated by deviation for snap rate
             decayed = initial_value * np.exp(-self.core.decay_lambda_base * time * self.core.deviation)
-            if decayed < self.core.base_range[0]:
-                decayed *= (1 + self.core.decay_lambda_base * time)
-                decayed = -decayed
-                decayed += np.random.normal(0, self.core.min_tension)
+            if decayed < self.core.base_range[0]:  # Grow negatives and flip for superposition
+                decayed *= (1 + self.core.decay_lambda_base * time)  # Growth factor for negatives
+                decayed = -decayed  # Invert sign
+                decayed += np.random.normal(0, self.core.min_tension)  # Add superposition noise
         elif decay_type == 'phantom':
             decayed = initial_value * np.exp(-self.core.decay_lambda_base * time * self.core.deviation)
             if initial_value < 0:
-                decayed *= (1 + abs(self.core.w_de_base - 0.1) * time)
+                decayed *= (1 + abs(self.core.w_de_base - 0.1) * time)  # Faster growth for phantom DE
             if decayed < self.core.base_range[0]:
                 decayed *= (1 + self.core.decay_lambda_base * time)
                 decayed = -decayed
                 decayed += np.random.normal(0, self.core.min_tension)
         elif decay_type == 'hawking':
+            # Power-law approximation for Hawking: M(t) = (M0^3 - α t)^{1/3}, α tuned by deviation
+            # α placeholder: Scaled by deviation to avoid rapid loss/infinities
+            alpha = self.core.decay_lambda_base * self.core.deviation  # Simple tuning; can link to G, hbar later
             if initial_value <= 0:
                 raise ValueError("Initial value must be positive for Hawking decay.")
-            alpha = self.core.decay_lambda_base * self.core.deviation
             cubed = initial_value ** 3 - alpha * time_s
             if cubed <= 0:
-                decayed = self.core.min_mass
+                decayed = self.core.min_mass  # Clamp to min_mass instead of 0/infinity
             else:
                 decayed = cubed ** (1/3)
             if decayed < self.core.min_mass:
-                decayed = self.core.min_mass
+                decayed = self.core.min_mass  # Floor
         else:
             raise ValueError(f"Unknown decay type: {decay_type}")
+        # Snap to finite equilibrium
         return self.core.utils.compute_equilibrium(np.array([decayed]))[0]
 
     def entropy_decay(self, initial_value, time, decay_type='radioactive', observer_cost=False, num_observers=1):
+        """
+        New: Blends decay_mechanism with entropy increase, optional observer cost.
+        
+        Args:
+            initial_value (float): Initial value.
+            time (float): Time in years.
+            decay_type (str): Decay type.
+            observer_cost (bool): If True, add cost based on num_observers.
+            num_observers (int): Number of observers for cost.
+        
+        Returns:
+            float: Decayed value with entropy.
+        """
         decayed = self.decay_mechanism(initial_value, time, decay_type)
         entropy_add = self.core.entropy_rate * time * self.core.deviation
-        decayed -= entropy_add
+        decayed -= entropy_add  # Increase disorder (subtract for weakening)
         if observer_cost:
-            decayed -= num_observers * self.core.min_tension
-        return max(decayed, self.core.base_range[0])
+            decayed -= num_observers * self.core.min_tension  # Cost for observing
+        return max(decayed, self.core.base_range[0])  # Clamp
 
     def corrosion_erosion_sim(self, initial_thickness, time, env_factor=1.0, decay_type='hawking'):
+        """
+        New: Simulates corrosion/erosion using entropy_decay, scaled by env_factor (e.g., 0.05 for mild corrosion).
+        
+        Args:
+            initial_thickness (float): Initial thickness (e.g., mm).
+            time (float): Time in years.
+            env_factor (float): Environmental scaling (default 1.0).
+            decay_type (str): Decay type (default 'hawking' for power-law wear).
+        
+        Returns:
+            float: Remaining thickness.
+        """
         remaining = self.entropy_decay(initial_thickness, time, decay_type)
-        return remaining * env_factor
+        return remaining * env_factor  # Scale by environment
 
     def compute_gravity_force(self, mass1, mass2, distance, position_ratio=0.5, t=0):
+        """
+        Computes gravitational force as a scaling force tied to mass, correlated with real-world G.
+        Scaled by sphere factors (pi variation, DE tension) for model integration.
+        "More mass = more force", snapped to equilibrium.
+        Tied to axion_anisotropy for small fluctuations (accuracy in clusters).
+        
+        Args:
+            mass1 (float): Mass of first object.
+            mass2 (float): Mass of second object.
+            distance (float): Distance between objects.
+            position_ratio (float): Average position ratio (default 0.5).
+            t (float): Time in years (default 0).
+        
+        Returns:
+            float: Scaled gravitational force, equilibrated.
+        """
         if distance <= 0:
             raise ValueError("Distance must be positive.")
+        # Base Newtonian force for real-world correlation
         force = self.core.G * mass1 * mass2 / (distance ** 2)
+        # Sphere modulation: Scale by deviation / pi_at_pos, counter DE tension
         pi_at_pos = self.core.simulate_pi_variation(position_ratio, t=t)
         tension = self.hybrid_de_tension(position_ratio, t=t)
-        scaled_force = force * (self.core.deviation / pi_at_pos) * (1 - tension)
+        scaled_force = force * (self.core.deviation / pi_at_pos) * (1 - tension)  # Gravity as counter to DE expansion
+        # Add axion fluctuation for accuracy
         ani = self.axion_anisotropy(position_ratio, t=t)
-        scaled_force += ani * force * 1e39
+        scaled_force += ani * force * 1e39  # Scaled up to match ~1e-5 relative fluctuation
+        scaled_force = max(scaled_force, 0)  # Fix: Clamp to non-negative
+        # Snap to finite equilibrium
         return self.core.utils.compute_equilibrium(np.array([scaled_force]))[0]
 
     def simulate_bh_conversion(self, physical_data, vibrational_data, position_ratio=1.0, t=0):
-        force = self.compute_gravity_force(1e30, 1e30, 1e10, position_ratio, t)
-        amplified_physical = physical_data * force * self.core.bend_modulator
+        """
+        Simulates hybrid black hole conversion: Amplified physical and echoed vibrational.
+        
+        Args:
+            physical_data (np.ndarray): Physical non-vibrational data.
+            vibrational_data (np.ndarray): Vibrational data.
+            position_ratio (float): Position (default 1.0 for boundary).
+            t (float): Time in years (default 0).
+        
+        Returns:
+            tuple: (amplified_physical, echoed_vibrational)
+        """
+        force = self.compute_gravity_force(1e30, 1e30, 1e10, position_ratio, t)  # Placeholder
+        amplified_physical = physical_data * force * self.core.bend_modulator  # Multiplier
         echoed_vibrational = self.core.utils.holographic_linkage(vibrational_data, position_ratio)
         return amplified_physical, echoed_vibrational
 
     def simulate_bh_evaporation(self, initial_mass, time, position_ratio=1.0, t_start=0):
+        """
+        New: Simulates black hole evaporation post-formation using adapted Hawking-like process.
+        Correlates to real scaling (tau ∝ M^3) with sphere adjustments (local_pi=2, tilde_c).
+        Integrates DE tension: Negative flip reverses to growth (phantom-like).
+        Clamped to min_mass to avoid zeros/infinities.
+        Tied to simulate_entanglement for entanglement-enhanced growth (ER=EPR analogy).
+        
+        Args:
+            initial_mass (float): Initial BH mass (kg).
+            time (float): Time elapsed (years).
+            position_ratio (float): Position (default 1.0 for boundary).
+            t_start (float): Starting cosmic time for tension (default 0).
+        
+        Returns:
+            float: Remaining mass at time, equilibrated.
+        """
         if initial_mass <= self.core.min_mass:
             raise ValueError("Initial mass must exceed min_mass.")
         local_pi = self.core.simulate_pi_variation(position_ratio, t=t_start + time)
         tilde_c = self.simulate_c_variation(position_ratio, t=t_start + time)
         tension = self.hybrid_de_tension(position_ratio, t=t_start + time)
+        
+        # Adapted alpha for dM/dt = -alpha / M^2; M(t) = (M0^3 - 3 alpha t)^{1/3}
+        # From adapted tau: alpha = (1.8083 * self.core.hbar * tilde_c**4) / (3 * 5120 * local_pi * self.core.G**2)
         alpha = (1.8083 * self.core.hbar * tilde_c**4) / (3 * 5120 * local_pi * self.core.G**2)
-        alpha *= self.core.deviation
-        time_s = time * self.core.sec_per_year
-        if tension >= 0:
+        alpha *= self.core.deviation  # Sphere modulation for finite tuning
+        time_s = time * self.core.sec_per_year  # SI units
+        
+        if tension >= 0:  # Normal evaporation
             cubed = initial_mass ** 3 - 3 * alpha * time_s
             if cubed <= 0:
                 mass = self.core.min_mass
             else:
                 mass = cubed ** (1/3)
-        else:
+        else:  # Negative tension: Reverse to growth (phantom)
             growth_factor = (1 + abs(tension) * self.core.decay_lambda_base * time)
+            # Tie to entanglement: Add violation as boost
             ent_viol = self.core.quantum_bio.simulate_entanglement([1.0, -1.0], [position_ratio, position_ratio])
-            growth_factor *= (1 + ent_viol / 2.828)
-            mass = initial_mass * growth_factor
-            mass = min(mass, initial_mass * 1e3)
-        mass = max(mass, self.core.min_mass)
+            growth_factor *= (1 + ent_viol / 2.828)  # Normalized to max Bell violation
+            mass = initial_mass * growth_factor  # Exponential growth
+            mass = min(mass, initial_mass * 1e3)  # Clamp growth to avoid infinity
+        
+        mass = max(mass, self.core.min_mass)  # Overall floor
+        # Holographic etch and equilibrium snap
         data_chain = np.array([mass])
         realized = self.core.utils.holographic_linkage(data_chain, position_ratio)[0]
         return self.core.utils.compute_equilibrium(np.array([realized]))[0]
@@ -728,45 +890,98 @@ class CosmoCore:
         speed_sacrifice = (self.core.c_base - tilde_c) / self.core.c_base
         energy_conserved = 1 - abs(tension) / self.core.base_de
         anchor_strength = gravity_anchor * (vib_speed / primordial_freq)
-        efficiency = (energy_conserved / max(speed_sacrifice, 1e-6)) * (1 + anchor_strength)
+        efficiency = (energy_conserved / max(speed_sacrifice, 1e-6)) * (1 + anchor_strength)  # Boosted by anchor
+        # Tie to pathfind: Add path efficiency
         path_eff = 1 / max(self.tension_pathfind(0, position_ratio, t=t), self.core.min_tension)
         efficiency *= path_eff
         return self.core.utils.compute_equilibrium(np.array([efficiency]))[0]
 
     def refract_vibration(self, amp, position_ratio, t=0):
+        """
+        New: Simulates refraction-inspired twist on vibration amplitude, using refractive index n = c_base / tilde_c.
+        Bends amplitude proportionally to (n - 1), clamped to base_range for finite resolution.
+        Ties to light speed as floor (min_c prevents infinite n).
+        
+        Args:
+            amp (float): Input amplitude to refract.
+            position_ratio (float): Position for c variation.
+            t (float): Time in years (default 0).
+        
+        Returns:
+            float: Refracted (twisted) amplitude.
+        """
         tilde_c = self.simulate_c_variation(position_ratio, t=t)
-        n = self.core.c_base / tilde_c if tilde_c > 0 else 1.0
-        bent = amp * (n - 1) * self.core.deviation / self.core.pi_center
-        bent = np.clip(bent, *self.core.base_range)
+        n = self.core.c_base / tilde_c if tilde_c > 0 else 1.0  # Refractive index, bounded by min_c
+        # Simple bend inspired by lens maker: (n - 1) * deviation scaling
+        bent = amp * (n - 1) * self.core.deviation / self.core.pi_center  # Normalized to center pi
+        bent = np.clip(bent, *self.core.base_range)  # Clamp to avoid infinities/zeros
         return bent
 
     def axion_anisotropy(self, position_ratio, t=0, multipole_l=2):
+        """
+        Computes CMB-like anisotropy using axion-modulated vibrations.
+        Tied to hybrid_de_tension via subtraction for DE weakening.
+        
+        Args:
+            position_ratio (float): Position ratio.
+            t (float): Time in years (default 0).
+            multipole_l (int): Multipole moment (default 2 for quadrupole).
+        
+        Returns:
+            float: Anisotropy value, clamped.
+        """
         local_pi = self.core.simulate_pi_variation(position_ratio, t)
         exp_term = np.exp(-self.core.decay_lambda_base * t * (self.core.deviation / self.simulate_c_variation(position_ratio, t, without_tension=True)))
         v_sphere = (self.core.axion_mass ** 2) * (self.core.deviation / local_pi) ** 2 * (1 - np.cos(position_ratio * self.core.effective_pi ** 2))
-        anisotropy = v_sphere * exp_term * (1 / multipole_l)
+        anisotropy = v_sphere * exp_term * (1 / multipole_l)  # Dipole for l=1, quadrupole for l=2
         adapt_min = self.core.base_range[0] * (1 + t * 1e-10)
         adapt_max = self.core.base_range[1] * (1 + t * 1e-10)
         return np.clip(anisotropy, adapt_min, adapt_max)
 
     def simulate_rotation_curve(self, mass, radii, position_ratio=0.7, t=0):
+        """
+        Simulates galaxy rotation curves with flatness from negative tension.
+        Tied to compute_gravity_force and perception_fold.
+        
+        Args:
+            mass (float): Central mass.
+            radii (np.ndarray): Radii array.
+            position_ratio (float): Position (default 0.7).
+            t (float): Time (default 0).
+        
+        Returns:
+            np.ndarray: Velocities.
+        """
         velocities = []
         for r in radii:
-            force = self.compute_gravity_force(mass, mass, r, position_ratio, t)
+            force = self.compute_gravity_force(mass, mass, r, position_ratio, t)  # Self-gravity proxy
             tension = self.hybrid_de_tension(position_ratio, t)
             v_sq = force * r / mass
             if v_sq < 0:
-                v_sq = 0
+                v_sq = 0  # Clamp negative to avoid imaginary v
             v = np.sqrt(v_sq) * (1 + self.core.bend_modulator * tension / self.core.simulate_pi_variation(position_ratio, t))
-            v = self.core.quantum_bio.perception_fold(np.array([v]))[0]
-            velocities.append(max(v, self.core.min_tension))
+            v = self.core.quantum_bio.perception_fold(np.array([v]))[0]  # Spiral warp
+            velocities.append(max(v, self.core.min_tension))  # Floor
         return np.array(velocities)
 
     def tension_pathfind(self, start_pos, end_pos, steps=10, t=0):
+        """
+        Computes optimized path cost using tension.
+        Tied to simulate_c_variation and hybrid_de_tension.
+        
+        Args:
+            start_pos (float): Start position ratio.
+            end_pos (float): End position ratio.
+            steps (int): Number of steps (default 10).
+            t (float): Time (default 0).
+        
+        Returns:
+            float: Total cost, equilibrated.
+        """
         positions = np.linspace(start_pos, end_pos, steps)
         costs = [1 / self.simulate_c_variation(p, t) * (1 + self.hybrid_de_tension(p, t) * self.core.deviation) for p in positions]
         total_cost = np.sum(costs) / steps
-        if total_cost < 0:
+        if total_cost < 0:  # Negative flip: Grow efficiency
             total_cost *= (1 + self.core.decay_lambda_base * t)
         return self.core.utils.compute_equilibrium(np.array([total_cost]))[0]
 
@@ -854,43 +1069,43 @@ class Pi2Framework:
                  grid_resolution=100, entity_density={'cosmic': 1000, 'planetary': 10000, 'human': 100000},  # Adjustable for deployment
                  neutral_observer_pos=np.array([0,0,0]), zoom_levels={'cosmic': (-1.0, 0.0), 'planetary': (0.0, 0.5), 'human': (0.5, 1.0)},
                  law_neutrality_factor=0.0, real_data_sources={}, simulation_timestep=1e-3, lod_thresholds=[1e15, 1e10, 1e5]):  # Adjusted lod for large radius
-        self.deviation = float(deviation)
-        self.effective_pi = 2.0
-        self.radius_base = float(radius)
-        self.radius = float(radius)
-        self.pi_center = np.pi
-        self.scale_factor = float(scale_factor)
-        self.base_de = float(base_de)
-        self.equilibrium_threshold = float(equilibrium_threshold)
-        self.de_multiplier = float(de_multiplier)
-        self.integer_snap_ratio = float(integer_snap_ratio)
-        self.h0_base = float(h0_base)
-        self.omega_m_base = float(omega_m_base)
-        self.w_de_base = float(w_de_base)
-        self.lambda_const = float(lambda_const)
-        self.t_cmb_base = float(t_cmb_base)
-        self.bend_modulator = 1 + self.w_de_base
-        self.decay_lambda_base = 1e-10
-        self.c_base = 299792458
-        self.G = 6.67430e-11
-        self.spiral_a = 0.0
-        self.spiral_b = self.deviation / 2
-        self.axion_mass = 1e-22
-        self.wa = 0.5
-        self.missed_coeff = 0.01
-        self.hbar = 1.0545718e-34
-        self.k_B = 1.380649e-23
-        self.sec_per_year = 3.15576e7
-        self.pi_cache = {}
-        self.entropy_rate = float(entropy_rate)
-        self.multi_obs = None
-        self.mathematical_center = np.array(mathematical_center)
-        self.learning_rate_dev = self.deviation / 10
-        self.min_tension = self.calculate_tension_floor()
-        self.base_range = (-self.min_tension, self.min_tension)
-        self.min_c = self.c_base * 0.1
-        self.min_mass = self.min_tension * 1e30
-        self.fluctuation_amplitude = self.min_tension / self.pi_center
+        self.deviation = float(deviation)  # Ensure float for consistency
+        self.effective_pi = 2.0  # Boundary value from model (fixed core mechanic)
+        self.radius_base = float(radius)  # Base radius for time-varying
+        self.radius = float(radius)  # For scaling simulations
+        self.pi_center = np.pi  # Local flat space pi (retained as 3.14 for consistency; not 4)
+        self.scale_factor = float(scale_factor)  # Optimized for greater effect at conversion
+        self.base_de = float(base_de)  # Base DE for hybrid solution
+        self.equilibrium_threshold = float(equilibrium_threshold)  # Snap precision
+        self.de_multiplier = float(de_multiplier)  # For DE evolution
+        self.integer_snap_ratio = float(integer_snap_ratio)  # Ratio for integer snaps
+        self.h0_base = float(h0_base)  # Hubble constant base
+        self.omega_m_base = float(omega_m_base)  # Matter density
+        self.w_de_base = float(w_de_base)  # DE equation of state
+        self.lambda_const = float(lambda_const)  # Cosmological constant
+        self.t_cmb_base = float(t_cmb_base)  # CMB temperature
+        self.bend_modulator = 1 + self.w_de_base  # Modulator for bend (0 for w=-1)
+        self.decay_lambda_base = 1e-10  # For decay/growth (e.g., in 1/yr units)
+        self.c_base = 299792458  # Speed of light in m/s (updated for unit consistency in BH sims)
+        self.G = 6.67430e-11  # Gravitational constant for real-world correlation
+        self.spiral_a = 0.0  # New: Archimedean spiral constant a
+        self.spiral_b = self.deviation / 2  # New: Spiral constant b for folding
+        self.axion_mass = 1e-22  # Axion mass for modulation
+        self.wa = 0.5  # For w0wa model
+        self.missed_coeff = 0.01  # Tuned for negative flip at ~30B years
+        self.hbar = 1.0545718e-34  # Reduced Planck's constant (J s)
+        self.k_B = 1.380649e-23  # Boltzmann constant (J/K)
+        self.sec_per_year = 3.15576e7  # Seconds per year for unit conversion
+        self.pi_cache = {}  # Cached Pi Variation Lookup
+        self.entropy_rate = float(entropy_rate)  # New: Entropy rate for gradual increase
+        self.multi_obs = None  # Placeholder for MultiObserver link
+        self.mathematical_center = np.array(mathematical_center)  # Center point for stability
+        self.learning_rate_dev = self.deviation / 10  # For AI tuning
+        self.min_tension = self.calculate_tension_floor()  # Calculated for reality mirroring
+        self.base_range = (-self.min_tension, self.min_tension)  # New: Base range for push/pull instead of 0
+        self.min_c = self.c_base * 0.1  # Minimum clamp for c variation to avoid unphysical values
+        self.min_mass = self.min_tension * 1e30  # Min mass floor (kg, proxy for finite resolution)
+        self.fluctuation_amplitude = self.min_tension / self.pi_center  # New: ~2.7e-6 for GR realism
         # New parameters
         self.grid_resolution = grid_resolution
         self.entity_density = entity_density
@@ -903,12 +1118,13 @@ class Pi2Framework:
         self.utils = Utils(self)
         self.quantum_bio = QuantumBio(self)
         self.cosmo_core = CosmoCore(self)
-        # New: SpatialHierarchy in CosmoCore, Visualizer in Utils
+        # New: Visualizer in Utils
         self.utils.visualizer = Visualizer(self)
         # Initialize a default MultiObserver
         self.multi_obs = self.quantum_bio.MultiObserver(self, num_observers=3)
 
     def calculate_tension_floor(self):
+        """Calculates min_tension based on real GR light deflection for the Sun."""
         M_sun = 1.989e30
         R_sun = 6.96e8
         deflection = 4 * self.G * M_sun / (self.c_base ** 2 * R_sun)
@@ -918,6 +1134,18 @@ class Pi2Framework:
         return f"Pi2Framework(deviation={self.deviation}, effective_pi={self.effective_pi}, radius={self.radius}, scale_factor={self.scale_factor}, base_de={self.base_de}, min_tension={self.min_tension}, base_range={self.base_range}, mathematical_center={self.mathematical_center}, equilibrium_threshold={self.equilibrium_threshold}, de_multiplier={self.de_multiplier}, integer_snap_ratio={self.integer_snap_ratio}, h0_base={self.h0_base}, omega_m_base={self.omega_m_base}, w_de_base={self.w_de_base}, lambda_const={self.lambda_const}, t_cmb_base={self.t_cmb_base}, bend_modulator={self.bend_modulator}, G={self.G}, entropy_rate={self.entropy_rate})"
 
     def simulate_pi_variation(self, position_ratio, t=0):
+        """
+        Models pi merging from ~3.14 (center) to 2 (boundary) based on position, with scaling for equilibrium.
+        Now time-dependent via radius evolution.
+        Updated: Added tapered fluctuation near center for baseline fuzz, clamped to preserve integrity.
+        
+        Args:
+            position_ratio (float): Ratio from center (0) to boundary (1).
+            t (float): Time in years (default 0).
+        
+        Returns:
+            float: Effective pi at position and time.
+        """
         if not 0 <= position_ratio <= 1:
             raise ValueError("Position ratio must be between 0 and 1.")
         key = (position_ratio, t)
@@ -1154,7 +1382,10 @@ class CurvatureTuner(nn.Module):
                 mask = torch.abs(param.data) < self.framework.equilibrium_threshold
                 # Set to base range instead of 0
                 signs = torch.sign(param.data[mask])
-                signs[signs == 0] = torch.tensor(np.random.choice([-1.0, 1.0], size=signs[signs == 0].shape))
+                zero_mask = (signs == 0)
+                if zero_mask.any():
+                    choices = np.random.choice([-1.0, 1.0], size=zero_mask.sum())
+                    signs[zero_mask] = torch.tensor(choices, dtype=torch.float32)  # Fix: dtype=float32
                 param.data[mask] = signs * self.framework.min_tension
 
     def train(self, inputs, targets, epochs=10, lambda_reg=0.1, position_ratio=0.5, t=0):
@@ -1463,8 +1694,8 @@ class TestPi2Framework(unittest.TestCase):
         self.fw.cosmo_core.spatial_hierarchy.generate_entities('cosmic')
         self.assertIn('cosmic', self.fw.cosmo_core.spatial_hierarchy.entities)
     def test_entity_interact(self):
-        e1 = Entity(np.array([0,0,0]), 'cosmic', self.fw)
-        e2 = Entity(np.array([1e8,0,0]), 'cosmic', self.fw)
+        e1 = Entity(np.array([0.,0.,0.]), 'cosmic', self.fw)
+        e2 = Entity(np.array([1e8,0.,0.]), 'cosmic', self.fw)
         tension = e1.interact_with(e2)
         self.assertIsInstance(tension, float)
     def test_run_simulation(self):
@@ -1475,17 +1706,17 @@ class TestPi2Framework(unittest.TestCase):
         fig = self.fw.utils.visualizer.render_sphere_view(0.0, 0, self.fw.neutral_observer_pos)
         self.assertIsNotNone(fig)
 
-# Usage Example
+# Usage Example: Integrate into Grok-like AI Project
 if __name__ == "__main__":
     fw = Pi2Framework()
     print("Hybrid DE Tension at Mid:", fw.cosmo_core.hybrid_de_tension(0.5))
-    print("Heat Death Timeline:", simulate_cosmic_phenomenon(fw, 'heat_death'))
+    print("Heat Death Timeline (Adjusted):", simulate_cosmic_phenomenon(fw, 'heat_death'))
     print("Molecular Diamond:", model_molecular_diamond(fw))
     print("Axion Anisotropy:", fw.cosmo_core.axion_anisotropy(0.5))
     print("Rotation Curve:", fw.cosmo_core.simulate_rotation_curve(1e41, np.array([1e20, 1e21])))
     print("Entanglement Violation:", fw.quantum_bio.simulate_entanglement([1, -1], [0.1, 0.9]))
     print("Path Cost:", fw.cosmo_core.tension_pathfind(0.1, 0.9))
-    print("Entropy Decay:", fw.cosmo_core.entropy_decay(1.0, 1e3))
+    print("Entropy Decay Example:", fw.cosmo_core.entropy_decay(1.0, 1e3))
     multi_obs = fw.quantum_bio.MultiObserver(fw, 10)
     multi_obs.speculation_ratio = 0.7
     data = np.array([1,2,3])
@@ -1493,4 +1724,8 @@ if __name__ == "__main__":
     print("Big Observer Predictions:", multi_obs.predict_big_observer_events(current_t=79))
     visualize_sphere(fw)
     suite = unittest.TestLoader().loadTestsFromTestCase(TestPi2Framework)
-    unittest.TextTestRunner(verbosity=2).run(suite)
+    unittest.TextTestRunner(verbosity=2).run(suite) # Run tests automatically
+
+fw = Pi2Framework()
+print(fw.cosmo_core.hybrid_de_tension(0.5))
+print(fw.cosmo_core.hybrid_de_tension(1.0))
