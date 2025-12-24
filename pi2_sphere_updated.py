@@ -22,6 +22,8 @@
 # - In interact_with: Added norm enforcement after pos update to keep inside sphere.
 # - In propagate_vibration: Clamped position ratios to [0,1].
 # - In test_cosmic_simulation: Adjusted assert to >1e10 for realistic value.
+# - Removed raise in simulate_pi_variation, added clamp position_ratio = np.clip(position_ratio, 0, 1)
+# - Similarly clamped in hybrid_de_tension, simulate_c_variation, etc.
 
 # Setup: Same as original, plus plotly for viz.
 
@@ -600,6 +602,7 @@ class CosmoCore:
         Returns:
             float: DE tension at position and time.
         """
+        position_ratio = np.clip(position_ratio, 0, 1)  # Clamp
         pi_at_pos = self.core.simulate_pi_variation(position_ratio, t=t)
         tilde_c = self.simulate_c_variation(position_ratio, t=t, without_tension=True)
         # Feedback-damped: Evolves quintessence-like, base * multiplier * (1 - dev / pi_at_pos) * exp(-decay * t * dev / tilde_c)
@@ -624,6 +627,7 @@ class CosmoCore:
     def hybrid_de_tension_vectorized(self, position_ratios, reversal=False, t=0):
         if not isinstance(position_ratios, np.ndarray):
             position_ratios = np.array([position_ratios])
+        position_ratios = np.clip(position_ratios, 0, 1)  # Clamp vectorized
         pi_at_pos = np.array([self.core.simulate_pi_variation(p, t=t) for p in position_ratios])
         tilde_c = np.array([self.simulate_c_variation(p, t=t, without_tension=True) for p in position_ratios])
         tension = self.core.base_de * self.core.de_multiplier * (1 - self.core.deviation / pi_at_pos) * np.exp(-self.core.decay_lambda_base * t * (self.core.deviation / tilde_c))
@@ -655,8 +659,7 @@ class CosmoCore:
         Returns:
             float: Effective coordinate speed of light at position and time.
         """
-        if not 0 <= position_ratio <= 1:
-            raise ValueError("Position ratio must be between 0 and 1.")
+        position_ratio = np.clip(position_ratio, 0, 1)  # Clamp
         delta = (self.core.pi_center - self.core.effective_pi) / self.core.pi_center
         tilde_c = self.core.c_base * (1 - delta * (position_ratio ** self.core.scale_factor))
         if not without_tension:
@@ -679,6 +682,7 @@ class CosmoCore:
         Returns:
             float: Adjusted distance after propagation, snapped to equilibrium.
         """
+        position_ratio_start = np.clip(position_ratio_start, 0, 1)
         position_ratio_end = min(position_ratio_start + (distance / self.core.get_radius(t)), 1.0)
         avg_pi = (self.core.simulate_pi_variation(position_ratio_start, t=t) + self.core.simulate_pi_variation(position_ratio_end, t=t)) / 2
         avg_c = (self.simulate_c_variation(position_ratio_start, t=t) + self.simulate_c_variation(position_ratio_end, t=t)) / 2
@@ -862,6 +866,7 @@ class CosmoCore:
         Returns:
             float: Remaining mass at time, equilibrated.
         """
+        position_ratio = np.clip(position_ratio, 0, 1)  # Clamp
         if initial_mass <= self.core.min_mass:
             raise ValueError("Initial mass must exceed min_mass.")
         local_pi = self.core.simulate_pi_variation(position_ratio, t=t_start + time)
@@ -922,6 +927,7 @@ class CosmoCore:
         Returns:
             float: Refracted (twisted) amplitude.
         """
+        position_ratio = np.clip(position_ratio, 0, 1)  # Clamp
         tilde_c = self.simulate_c_variation(position_ratio, t=t)
         n = self.core.c_base / tilde_c if tilde_c > 0 else 1.0  # Refractive index, bounded by min_c
         # Simple bend inspired by lens maker: (n - 1) * deviation scaling
@@ -942,6 +948,7 @@ class CosmoCore:
         Returns:
             float: Anisotropy value, clamped.
         """
+        position_ratio = np.clip(position_ratio, 0, 1)  # Clamp
         local_pi = self.core.simulate_pi_variation(position_ratio, t)
         exp_term = np.exp(-self.core.decay_lambda_base * t * (self.core.deviation / self.simulate_c_variation(position_ratio, t, without_tension=True)))
         v_sphere = (self.core.axion_mass ** 2) * (self.core.deviation / local_pi) ** 2 * (1 - np.cos(position_ratio * self.core.effective_pi ** 2))
@@ -964,6 +971,7 @@ class CosmoCore:
         Returns:
             np.ndarray: Velocities.
         """
+        position_ratio = np.clip(position_ratio, 0, 1)  # Clamp
         velocities = []
         for r in radii:
             force = self.compute_gravity_force(mass, mass, r, position_ratio, t)  # Self-gravity proxy
@@ -990,6 +998,8 @@ class CosmoCore:
         Returns:
             float: Total cost, equilibrated.
         """
+        start_pos = np.clip(start_pos, 0, 1)
+        end_pos = np.clip(end_pos, 0, 1)
         positions = np.linspace(start_pos, end_pos, steps)
         costs = [1 / self.simulate_c_variation(p, t) * (1 + self.hybrid_de_tension(p, t) * self.core.deviation) for p in positions]
         total_cost = np.sum(costs) / steps
@@ -1158,8 +1168,7 @@ class Pi2Framework:
         Returns:
             float: Effective pi at position and time.
         """
-        if not 0 <= position_ratio <= 1:
-            raise ValueError("Position ratio must be between 0 and 1.")
+        position_ratio = np.clip(position_ratio, 0, 1)  # Clamp to prevent errors
         key = (position_ratio, t)
         if key in self.pi_cache:
             return self.pi_cache[key]
@@ -1246,9 +1255,11 @@ class Pi2Framework:
                     for j in range(i+1, len(ents)):
                         ents[i].interact_with(ents[j], t=t)
                     # Individual evolution
-                    ents[i].vib_amp = self.quantum_bio.propagate_vibration(ents[i].vib_amp, 1.0, position_ratio_start=np.linalg.norm(ents[i].pos)/self.radius, t=t)
+                    pos_norm = np.linalg.norm(ents[i].pos)
+                    position_ratio = min(pos_norm / self.radius, 1.0 - 1e-6)  # Clamp with buffer
+                    ents[i].vib_amp = self.quantum_bio.propagate_vibration(ents[i].vib_amp, 1.0, position_ratio_start=position_ratio, t=t)
                     if scale == 'cosmic':
-                        ents[i].mass = self.cosmo_core.simulate_bh_evaporation(ents[i].mass, self.simulation_timestep, position_ratio=np.linalg.norm(ents[i].pos)/self.radius, t_start=t)
+                        ents[i].mass = self.cosmo_core.simulate_bh_evaporation(ents[i].mass, self.simulation_timestep, position_ratio=position_ratio, t_start=t)
                     ents[i].vib_amp = self.cosmo_core.entropy_decay(ents[i].vib_amp, self.simulation_timestep)
                     ents[i].vib_amp = np.clip(ents[i].vib_amp, *self.base_range)
             t += self.simulation_timestep
