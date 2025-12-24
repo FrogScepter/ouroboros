@@ -1,0 +1,8 @@
+numpy
+sympy
+torch
+matplotlib
+astropy
+plotly
+scipy
+streamlit
